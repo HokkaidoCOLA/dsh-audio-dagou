@@ -1,0 +1,13 @@
+# dsh-audio-dagou bundle layer — 配音效插件。
+#
+# package.json 声明了 dsh.bundle.patch（本文件），因此 `dsh plugin --profile
+# web add <本包路径>` 安装后会把它自动并入 profile 的 bundle 层
+# （dsh.profile.bundles），下面这条 insert 随 bundle 自动应用——用户无需再
+# 手动编辑 profile 的 cordis.patch.yml 即可启用本插件。
+#
+# 后续层（profile 自己的 cordis.patch.yml、--patch 覆盖）可按 id 覆写本行
+# 的 config（例如关闭声音 / 换音频路径 / 调整叫的上限与倍数）。
+
+- insert:
+    - id: dsh-audio-dagou
+      name: '@dsh-external/dsh-audio-dagou'
