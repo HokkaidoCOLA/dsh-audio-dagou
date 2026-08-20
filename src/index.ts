@@ -23,8 +23,9 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent' // 引入 dsh-agent 的事件类型增强（agent/turn-stopping）
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import Schema from '@deepseek-ai/schemastery'
-import { spawn } from 'node:child_process'
+import { type ChildProcess, spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const name = 'dsh-audio-dagou'
@@ -37,6 +38,18 @@ const ASK_USER_TOOL = 'ask_user_question'
 
 /** 插件自带音频资产目录（lib/../assets）。 */
 const ASSETS_DIR = fileURLToPath(new URL('../assets/', import.meta.url))
+
+/** 内置音效文件名：填这三个名字即用插件自带资产，其余按路径处理。 */
+const BUILTIN_SOUNDS = new Set(['大狗.wav', '诶.wav', '叫.wav'])
+
+/**
+ * 每 agent 命令计数的保留上限。
+ *
+ * 正常情况下每个 key 都会在 `agent/turn-stopping` 时被删除；但被强制中断、
+ * 崩溃、或根本没走到 turn 边界的 agent 会留下孤儿键。长期运行的 host 里每个
+ * subagent 的 id 都不同，不设上限则该 Map 会无界增长——超限时按插入序淘汰最旧的。
+ */
+const MAX_TRACKED_AGENTS = 256
 
 export interface Config {
   /** 总开关：false 时全部静音（仍计数）。 */
@@ -81,16 +94,6 @@ const DEFAULTS: Config = {
   barkMaxMs: 0,
 }
 
-/**
- * 每 agent 的命令计数（按 agent.id 隔离；subagent 与主 agent 互不清零）。
- * key：agent?.id ?? '?' —— 没有 agent 归属的工具调用归入兜底键。
- * 放模块级便于跨事件共享；每轮 turn-stopping 结束后该键即被删除。
- */
-const counts = new Map<string, number>()
-
-/** 是否已有一轮「叫」的连播在进行（防御并发 turn-stopping 重复触发）。 */
-let barkChainRunning = false
-
 /** 从 agent 对象取稳定 id；缺省回退 '?'。 */
 function agentKey(agent: { id?: string } | null | undefined): string {
   return agent?.id ?? '?'
@@ -99,10 +102,61 @@ function agentKey(agent: { id?: string } | null | undefined): string {
 /** 解析音效配置：内置文件名 → 插件资产绝对路径；其余（绝对路径）原样使用。 */
 function resolveSound(spec: string): string {
   if (!spec) return ''
-  if (spec === '大狗.wav' || spec === '诶.wav' || spec === '叫.wav') {
-    return fileURLToPath(new URL(`../assets/${spec}`, import.meta.url))
-  }
-  return spec
+  return BUILTIN_SOUNDS.has(spec) ? join(ASSETS_DIR, spec) : spec
+}
+
+/**
+ * 一个已解析、已校验的音效。
+ *
+ * 存在性在 apply 时判定一次并缓存：`tools/result` 是热路径（模型每执行一条
+ * 命令都要过一遍），原实现每次播放前都做一次同步 existsSync——既在事件循环上
+ * 压一次阻塞式系统调用，又会在路径配错时把同一行警告刷满整个会话日志。
+ */
+interface Sound {
+  /** 解析后的绝对路径；空字符串 = 未配置。 */
+  path: string
+  /** apply 时文件是否存在；false 则该音效的所有播放静默跳过。 */
+  ok: boolean
+}
+
+/** 解析并校验一个音效（同步 stat 全程只做这一次），缺失时只警告一次。 */
+function prepareSound(spec: string, label: string): Sound {
+  const path = resolveSound(spec)
+  if (!path) return { path: '', ok: false }
+  const ok = existsSync(path)
+  if (!ok) console.warn(`[dsh-audio-dagou] ${label}音效文件不存在，相关播放将跳过：${path}`)
+  return { path, ok }
+}
+
+/**
+ * 给播放进程挂一个「最长播放时长」看门狗。
+ * 子进程先自然退出就撤掉定时器；定时器 unref，避免一个待触发的 kill 把 host
+ * 的退出硬拖 maxMs。
+ * @param child 播放子进程。
+ * @param maxMs 超时强杀毫秒数；<=0 表示不截断。
+ */
+function armKillTimer(child: ChildProcess, maxMs: number): void {
+  if (maxMs <= 0) return
+  const timer = setTimeout(() => child.kill(), maxMs)
+  timer.unref?.()
+  child.once('exit', () => clearTimeout(timer))
+}
+
+/**
+ * 生成 Windows 播放脚本：一个 PowerShell 进程内播 times 声。
+ * @param file 音频绝对路径。
+ * @param times 播放次数。
+ * @param gapMs 两声之间间隔（最后一声之后不等待）。
+ * @returns PowerShell 命令串。
+ */
+function psPlayScript(file: string, times: number, gapMs: number): string {
+  // 全限定类型名：PowerShell 无法解析未带 System. 前缀的 Media.SoundPlayer
+  const player = `$p = New-Object System.Media.SoundPlayer '${file.replaceAll("'", "''")}';`
+  if (times <= 1) return `${player} $p.PlaySync();`
+  const gap = gapMs > 0
+    ? ` if ($i -lt ${times - 1}) { Start-Sleep -Milliseconds ${Math.round(gapMs)} };`
+    : ''
+  return `${player} for ($i = 0; $i -lt ${times}; $i++) { $p.PlaySync();${gap} }`
 }
 
 /**
@@ -110,28 +164,24 @@ function resolveSound(spec: string): string {
  * - darwin → afplay
  * - win32  → PowerShell SoundPlayer（System.Media.SoundPlayer）
  * - linux  → paplay（无则 pw-play，无则 aplay）
- * 找不到文件 / 播放器缺失 / 播放失败都静默吞掉，保证不影响宿主流程。
- * @param file 音频文件绝对路径。
+ * 播放器缺失 / 播放失败都静默吞掉，保证不影响宿主流程。
+ * @param sound 已校验的音效。
  * @param maxMs 播放超过该时长强制停止；0 = 不截断。
  */
-function playFile(file: string, maxMs = 0): void {
-  if (!file) return
-  if (!existsSync(file)) {
-    console.warn(`[dsh-audio-dagou] 音效文件不存在，跳过播放：${file}`)
-    return
-  }
+function playFile(sound: Sound, maxMs = 0): void {
+  if (!sound.ok) return
+  const file = sound.path
   try {
     if (process.platform === 'darwin') {
       const child = spawn('afplay', [file], { stdio: 'ignore' })
       child.on('error', () => { /* 播放器缺失等，静默 */ })
-      if (maxMs > 0) setTimeout(() => child.kill(), maxMs)
+      armKillTimer(child, maxMs)
       return
     }
     if (process.platform === 'win32') {
-      // 全限定类型名：PowerShell 无法解析未带 System. 前缀的 Media.SoundPlayer
-      const script = `(New-Object System.Media.SoundPlayer '${file.replaceAll("'", "''")}').PlaySync();`
-      const child = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], { stdio: 'ignore' })
+      const child = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', psPlayScript(file, 1, 0)], { stdio: 'ignore' })
       child.on('error', () => { /* 静默 */ })
+      armKillTimer(child, maxMs)
       return
     }
     // linux：优先 PulseAudio → PipeWire → ALSA。
@@ -140,6 +190,7 @@ function playFile(file: string, maxMs = 0): void {
       if (index >= names.length) return
       const child = spawn(names[index], [file], { stdio: 'ignore' })
       child.on('error', () => tryPlayer(index + 1))
+      armKillTimer(child, maxMs)
     }
     tryPlayer(0)
   } catch {
@@ -147,30 +198,107 @@ function playFile(file: string, maxMs = 0): void {
   }
 }
 
-/** 后台连播 n 声「叫」，间隔 gapMs；fire-and-forget（对外节流，防止重复触发）。 */
-function playBarks(assetPath: string, times: number, gapMs: number, maxMs: number): void {
-  if (barkChainRunning) return
-  barkChainRunning = true
-  void (async () => {
-    try {
-      for (let i = 0; i < times; i++) {
-        playFile(assetPath, maxMs)
-        await new Promise((resolve) => setTimeout(resolve, gapMs))
+/**
+ * 「叫」的连播控制器（每个 apply 一个实例）。
+ *
+ * 连播在后台进行，绝不阻塞 `agent/turn-stopping`（那是个串行且被 await 的边界）；
+ * 同一时刻只允许一轮，避免主 agent 与 subagent 的回合叠成噪音。
+ * @returns 控制器：play 发起连播，dispose 在热重载/卸载时中断。
+ */
+function createBarkChain() {
+  let running = false
+  let disposed = false
+  let timer: ReturnType<typeof setTimeout> | null = null
+
+  /** 可被 dispose 打断的等待。 */
+  const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms)
+    timer.unref?.() // 待触发的间隔不该拖住 host 退出
+  })
+
+  return {
+    /**
+     * 后台连播 times 声；已有一轮在播时直接忽略。
+     * @param sound 叫声音效。
+     * @param times 播放次数。
+     * @param gapMs 间隔毫秒。
+     * @param maxMs 单声最长毫秒；0 = 不截断。
+     */
+    play(sound: Sound, times: number, gapMs: number, maxMs: number): void {
+      if (running || disposed || !sound.ok || times <= 0) return
+      running = true
+
+      if (process.platform === 'win32') {
+        // Windows 每次 spawn PowerShell 都有约 100 ms 冷启动，连播 10 声等于开
+        // 10 个进程；改成在一个进程里循环播完，省掉 N-1 次进程创建。
+        try {
+          const child = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', psPlayScript(sound.path, times, gapMs)], { stdio: 'ignore' })
+          const done = (): void => { running = false }
+          child.on('error', done)
+          child.once('exit', done)
+          armKillTimer(child, maxMs > 0 ? times * (maxMs + gapMs) : 0)
+        } catch {
+          running = false
+        }
+        return
       }
-    } catch {
-      /* 静默 */
-    } finally {
-      barkChainRunning = false
-    }
-  })()
+
+      void (async () => {
+        try {
+          for (let i = 0; i < times; i += 1) {
+            if (disposed) return
+            playFile(sound, maxMs)
+            // 最后一声之后不再等待：原实现要多睡一个 gap 才收尾
+            if (i < times - 1) await sleep(gapMs)
+          }
+        } catch {
+          /* 静默 */
+        } finally {
+          running = false
+        }
+      })()
+    },
+
+    /** 插件卸载 / 热重载：中断连播并清掉待触发的间隔定时器。 */
+    dispose(): void {
+      disposed = true
+      if (timer) { clearTimeout(timer); timer = null }
+      running = false
+    },
+  }
 }
 
 export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
   const config: Config = { ...DEFAULTS, ...(rawConfig ?? {}) }
 
-  const commandSound = resolveSound(config.soundCommand)
-  const questionSound = resolveSound(config.soundQuestion)
-  const barkSound = resolveSound(config.soundBark)
+  // 三个音效各解析 + stat 一次；此后热路径上再无任何文件系统调用。
+  const commandSound = prepareSound(config.soundCommand, '命令')
+  const questionSound = prepareSound(config.soundQuestion, '提问')
+  const barkSound = prepareSound(config.soundBark, '叫声')
+
+  /**
+   * 每 agent 的命令计数（按 agent.id 隔离；subagent 与主 agent 互不清零）。
+   * key：agent?.id ?? '?' —— 没有 agent 归属的工具调用归入兜底键。
+   * 放在 apply 作用域内：热重载即重置，且插件被装载两次时两个实例互不串扰。
+   */
+  const counts = new Map<string, number>()
+
+  /** 叫声连播控制器；插件卸载时随 effect 一起中断。 */
+  const barks = createBarkChain()
+  ctx.effect(() => () => barks.dispose(), 'dsh-audio-dagou: bark chain')
+
+  /**
+   * 命令计数 +1，并把 Map 规模压在 MAX_TRACKED_AGENTS 以内。
+   * @param key agent 标识。
+   */
+  function bump(key: string): void {
+    counts.set(key, (counts.get(key) ?? 0) + 1)
+    if (counts.size > MAX_TRACKED_AGENTS) {
+      // Map 迭代按插入序：淘汰最旧的键（那些 agent 的回合早就结束了）
+      const oldest = counts.keys().next()
+      if (!oldest.done) counts.delete(oldest.value)
+    }
+  }
 
   /**
    * 观察每次工具执行的最终结果（observe-only，故障被包容）：
@@ -180,8 +308,7 @@ export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
   ctx.effect(() => ctx.on('tools/result', (exec) => {
     if (!config.enabled) return
     if (exec.name === BASH_TOOL) {
-      const key = agentKey(exec.agent)
-      counts.set(key, (counts.get(key) ?? 0) + 1)
+      bump(agentKey(exec.agent))
       playFile(commandSound)
     } else if (exec.name === ASK_USER_TOOL) {
       playFile(questionSound)
@@ -191,7 +318,7 @@ export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
   /**
    * 每轮任务结束边界（模型已给出最终回答、无未决工具调用）：
    * 只结算【该 agent 自己】的本轮命令计数，按比例连播「叫」（封顶 maxBarks），
-   * 结算后删除该 agent 的计数（清零）。监听器内不阻塞（连播改后台异步）。
+   * 结算后删除该 agent 的计数（清零）。监听器内不阻塞（连播在后台异步进行）。
    */
   ctx.effect(() => ctx.on('agent/turn-stopping', (payload: { agent: Agent }) => {
     if (!config.enabled) return
@@ -200,7 +327,7 @@ export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
     counts.delete(key)
     const times = Math.min(config.maxBarks, Math.round(n * config.barkScale))
     if (times <= 0) return
-    playBarks(barkSound, times, config.barkGapMs, config.barkMaxMs)
+    barks.play(barkSound, times, config.barkGapMs, config.barkMaxMs)
   }), 'dsh-audio-dagou: turn-end barks')
 
   /**
@@ -220,13 +347,15 @@ export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
       if (process.platform === 'darwin') player.push('afplay')
       else if (process.platform === 'win32') player.push('powershell')
       else player.push('paplay', 'pw-play', 'aplay')
+      // installed 走实时 existsSync：冷路径，且要反映「现在」而非 apply 那一刻
+      const live = (sound: Sound): string | null => (sound.path && existsSync(sound.path) ? sound.path : null)
       return JSON.stringify({
         ok: true,
         counts: Object.fromEntries(counts),
         installed: {
-          bigDog: existsSync(commandSound) ? commandSound : null,
-          eh: existsSync(questionSound) ? questionSound : null,
-          bark: existsSync(barkSound) ? barkSound : null,
+          bigDog: live(commandSound),
+          eh: live(questionSound),
+          bark: live(barkSound),
         },
         config: {
           enabled: config.enabled,
@@ -242,7 +371,4 @@ export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
       })
     },
   })), 'dsh-audio-dagou: status tool')
-
-  // 仅用于模块完整性（host 无客户端注入）。保留 ASSETS_DIR 常量以防误删被引用。
-  void ASSETS_DIR
 }
