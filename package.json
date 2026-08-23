@@ -1,7 +1,7 @@
 {
   "name": "@dsh-external/dsh-audio-dagou",
-  "version": "0.0.3",
-  "description": "一个给 DeepSeek Harness（DSH）web 会话配音效的插件「大狗」：执行命令后播「大狗」，模型向你提问时播「叮咚鸡」，每轮任务结束按命令次数成正比地播「叫」（上限 10 声）。",
+  "version": "0.0.4",
+  "description": "一个给 DeepSeek Harness（DSH）web 会话配音效的插件「大狗」：执行命令后播「大狗」，模型向你提问时播「叮咚鸡」，读到工作区外文件时播「诶」（同回答确认音），每轮任务结束按命令次数成正比地播「叫」（上限 10 声）。",
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/types/index.d.ts",

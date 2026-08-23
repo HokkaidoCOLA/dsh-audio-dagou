@@ -7,11 +7,16 @@
  *   3. bash 计数、ask_user_question 提问瞬间转发、按 agent 隔离、turn 结束清零
  *   4. 三平台播放器映射（darwin→afplay / win32→powershell / linux→paplay|pw-play|aplay）
  *   5. 内置音频资产（中文文件名）真实存在
+ *   6. 读工作区外判定（isPathContained：越界 / 前缀误判 / symlink 别名 / 大小写）
+ *      与 read 结果分支的健壮性（缺字段不崩、不计入 bash 计数）
  *
  * 声音路径故意指向不存在的文件，避免 CI 里真的出声；计数逻辑照常全量执行。
  * 断言失败时以非零码退出。
  */
-import { existsSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
 let failed = 0
@@ -119,6 +124,54 @@ for (const f of ['大狗.wav', '叮咚鸡.wav', '诶.wav', '叫.wav']) {
   const p = fileURLToPath(new URL(f, assetsDir))
   check(`assets/${f} 存在`, existsSync(p))
 }
+
+console.log('[6] 读工作区外判定（isPathContained）')
+const repo = fileURLToPath(new URL('..', import.meta.url))
+const repoRoot = repo.replace(/[\\/]+$/, '') // 去掉尾部分隔符，便于构造兄弟目录
+check('相对路径在工作区内', P.isPathContained(repo, 'src/index.ts') === true)
+check('绝对路径在工作区内', P.isPathContained(repo, fileURLToPath(new URL('lib/index.js', import.meta.url))) === true)
+check('上层目录越界', P.isPathContained(repo, '../dsh-audio-dagou-elsewhere/x.txt') === false)
+check('前缀相似的兄弟目录不算包含', P.isPathContained(repoRoot, repoRoot + '2/x.txt') === false)
+if (process.platform === 'win32') {
+  check('win32 忽略大小写', P.isPathContained('C:\\WS\\Repo', 'c:\\ws\\repo\\src\\a.ts') === true)
+}
+
+const tReal = mkdtempSync(join(tmpdir(), 'dagou-ws-'))
+const tAlias = join(tmpdir(), `dagou-alias-${randomUUID()}`)
+let tmpFiles = [tReal]
+try {
+  writeFileSync(join(tReal, 'inside.txt'), 'x')
+  symlinkSync(tReal, tAlias)
+  tmpFiles.push(tAlias)
+  // 工作区根本身是 symlink（macOS /tmp → /private/tmp 场景）：真实路径拼写仍算在内
+  check('工作区为 symlink 别名：真实路径目标仍算在内', P.isPathContained(tAlias, join(tReal, 'inside.txt')) === true)
+  // 工作区内 symlink 指向工作区外：读到的内容来自外面 → 算越界
+  const outside = join(tmpdir(), `dagou-out-${randomUUID()}.txt`)
+  writeFileSync(outside, 'x')
+  tmpFiles.push(outside)
+  symlinkSync(outside, join(tReal, 'leak.txt'))
+  check('工作区内 symlink 指向外部文件算越界', P.isPathContained(tReal, join(tReal, 'leak.txt')) === false)
+} catch (error) {
+  console.log('  - 跳过 symlink 用例（当前平台不允许创建符号链接）:', error.message)
+} finally {
+  for (const f of tmpFiles) {
+    try { rmSync(f, { recursive: true, force: true }) } catch { /* 清理失败不影响结果 */ }
+  }
+}
+
+// read 结果分支健壮性：缺字段 / 非字符串 file_path 都不崩，也不计入 bash 计数
+let threw = false
+try {
+  handlers['tools/result']({ name: 'read', agent: { id: 'r1' }, arguments: { file_path: 42 } }, { isError: false })
+  handlers['tools/result']({ name: 'read', agent: { id: 'r2' } }, { isError: false })
+  handlers['tools/result']({ name: 'read', agent: { id: 'r3' }, arguments: { file_path: '../outside.txt' } }, { isError: true })
+} catch (e) {
+  threw = true
+  console.error('  read 结果分支抛异常:', e)
+}
+check('read 结果分支不抛异常', threw === false)
+const s6 = await status2()
+check('read 不计入命令计数', s6.counts['r1'] === undefined && s6.counts['r2'] === undefined && s6.counts['r3'] === undefined)
 
 if (failed > 0) {
   console.error(`\nSMOKE FAILED: ${failed} 项失败`)

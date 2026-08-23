@@ -11,7 +11,12 @@
  *      此刻 == 工具刚返回、用户刚提交答案）；
  *   4. 每一轮用户请求（一个 agent turn）结束时 → 按本轮命令计数成正比地播放
  *      「叫.wav」，播放次数 = min(round(计数 × barkScale), maxBarks)（默认最多 10 声），
- *      随后把该 agent 的计数清零。
+ *      随后把该 agent 的计数清零；
+ *   5. 模型用 `read` 工具读取【会话工作区之外】的文件（读取成功时）→ 先播
+ *      「叮咚鸡.wav」（与提问同款）、再播「诶.wav」（与回答确认音同款默认音效）：
+ *      任一沙箱 mode 下读取都不受限，读出的内容可能来自工作区之外，读取成功
+ *      的瞬间补一声提问式提醒 + 一声确认。默认音效即上两项；`soundReadOutside`
+ *      可单独换掉「诶」，提问音跟随 `soundQuestion`。
  *
  * 实现要点（符合官方插件规范）：
  *   - Cordis 插件形态：导出 name / inject / Config / apply；
@@ -29,8 +34,8 @@ import type { Agent } from '@deepseek-ai/dsh-agent' // 引入 dsh-agent 的事�
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import Schema from '@deepseek-ai/schemastery'
 import { type ChildProcess, spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, realpathSync } from 'node:fs'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const name = 'dsh-audio-dagou'
@@ -40,6 +45,8 @@ export const inject = ['tools']
 const BASH_TOOL = 'bash'
 /** 模型向用户提问的工具名（dsh-tool-ask-user 注册）。 */
 const ASK_USER_TOOL = 'ask_user_question'
+/** 模型读取文本文件的工具名（dsh-tool-fs 注册）。 */
+const READ_TOOL = 'read'
 
 /** 插件自带音频资产目录（lib/../assets）。 */
 const ASSETS_DIR = fileURLToPath(new URL('../assets/', import.meta.url))
@@ -65,6 +72,8 @@ export interface Config {
   soundQuestion: string
   /** 用户回答完问题后播放的音效。内置：`诶.wav`；或填任意绝对路径。 */
   soundAnswer: string
+  /** 读工作区外文件时后播的音效（先播一声提问音 `soundQuestion`，再播它）。内置：`诶.wav`（回答确认音同款）；或填任意绝对路径。 */
+  soundReadOutside: string
   /** 任务结束时连播的叫声音效。内置：`叫.wav`；或填任意绝对路径。 */
   soundBark: string
   /** 播放次数 = min(round(命令计数 × 该倍数), maxBarks)；默认 1（严格正比）。 */
@@ -83,6 +92,7 @@ export const Config: Schema<Config> = Schema.object({
   soundCommand: Schema.string().default('大狗.wav'),
   soundQuestion: Schema.string().default('叮咚鸡.wav'),
   soundAnswer: Schema.string().default('诶.wav'),
+  soundReadOutside: Schema.string().default('诶.wav'),
   soundBark: Schema.string().default('叫.wav'),
   barkScale: Schema.number().min(0).step(0.1).default(1),
   maxBarks: Schema.number().min(1).max(100).step(1).default(10),
@@ -96,6 +106,7 @@ const DEFAULTS: Config = {
   soundCommand: '大狗.wav',
   soundQuestion: '叮咚鸡.wav',
   soundAnswer: '诶.wav',
+  soundReadOutside: '诶.wav',
   soundBark: '叫.wav',
   barkScale: 1,
   maxBarks: 10,
@@ -112,6 +123,55 @@ function agentKey(agent: { id?: string } | null | undefined): string {
 function resolveSound(spec: string): string {
   if (!spec) return ''
   return BUILTIN_SOUNDS.has(spec) ? join(ASSETS_DIR, spec) : spec
+}
+
+/**
+ * 对「可能不存在」的路径做尽可能深的真实路径解析：从最深的已存在祖先 realpath，
+ * 再把剩余不存在的后缀拼回去。
+ *
+ * 用于把工作区根与读取目标都归一化，消除符号链接拼写差异（macOS 的 /tmp →
+ * /private/tmp、工作区内指向工作区外的 symlink、别名等价根），避免误判归属。
+ * 只在 `read` 工具的结果上调用（不是 bash 热路径），这里的同步系统调用可忽略。
+ */
+function realpathDeepest(input: string): string {
+  let current = input
+  const rest: string[] = []
+  while (true) {
+    try {
+      const real = realpathSync(current)
+      return rest.length > 0 ? join(real, ...rest) : real
+    } catch {
+      const parent = dirname(current)
+      if (parent === current) return input // 连根都无法解析：退回词法路径
+      rest.unshift(basename(current))
+      current = parent
+    }
+  }
+}
+
+/**
+ * 判定 targetPath（相对或绝对路径）是否位于 workspaceRoot 之内（含根自身）。
+ *
+ * 与 dsh-tool-fs 的 `read` 工具同口径：相对路径以工作区为基解析；两侧都经
+ * `realpathDeepest` 归一化后再比较（win32 大小写不敏感，其余平台敏感）。
+ * 导出它是为了冒烟测试能直接覆盖判定逻辑（前缀误判 / 越级、symlink 别名、大小写）。
+ */
+export function isPathContained(workspaceRoot: string, targetPath: string): boolean {
+  const root = realpathDeepest(resolve(workspaceRoot))
+  const target = realpathDeepest(resolve(root, targetPath))
+  const insensitive = process.platform === 'win32'
+  const a = insensitive ? root.toLowerCase() : root
+  const b = insensitive ? target.toLowerCase() : target
+  if (b === a) return true
+  const prefix = a.endsWith(sep) ? a : a + sep
+  return b.startsWith(prefix)
+}
+
+/** 从工具 arguments 里取 `read` 的 file_path；缺失或非字符串时返回 null。 */
+function readRequestedFilePath(argumentsValue: unknown): string | null {
+  if (typeof argumentsValue !== 'object' || argumentsValue === null) return null
+  const filePath = (argumentsValue as { file_path?: unknown }).file_path
+  return typeof filePath === 'string' && filePath.length > 0 ? filePath : null
 }
 
 /**
@@ -169,42 +229,94 @@ function psPlayScript(file: string, times: number, gapMs: number): string {
 }
 
 /**
- * 播放一个音频文件：fire-and-forget、绝不抛错。
+ * 启动一次播放，播放结束（自然退出或被截断）时回调 onDone；播放器缺失、spawn
+ * 失败、全部候选播放器不可用时也回调——onDone 恰好触发一次，绝不抛错。
  * - darwin → afplay
  * - win32  → PowerShell SoundPlayer（System.Media.SoundPlayer）
  * - linux  → paplay（无则 pw-play，无则 aplay）
- * 播放器缺失 / 播放失败都静默吞掉，保证不影响宿主流程。
- * @param sound 已校验的音效。
+ * @param sound 已校验的音效（ok=false 直接结束）。
  * @param maxMs 播放超过该时长强制停止；0 = 不截断。
+ * @param onDone 结束回调（用于串联下一段音效；fire-and-forget 调用方传空函数）。
  */
-function playFile(sound: Sound, maxMs = 0): void {
-  if (!sound.ok) return
+function spawnOnce(sound: Sound, maxMs: number, onDone: () => void): void {
+  const done = ((): (() => void) => {
+    let fired = false
+    return (): void => {
+      if (!fired) { fired = true; onDone() }
+    }
+  })()
+  if (!sound.ok) {
+    done()
+    return
+  }
   const file = sound.path
   try {
     if (process.platform === 'darwin') {
       const child = spawn('afplay', [file], { stdio: 'ignore' })
-      child.on('error', () => { /* 播放器缺失等，静默 */ })
+      child.on('error', done)
+      child.once('exit', done)
       armKillTimer(child, maxMs)
       return
     }
     if (process.platform === 'win32') {
       const child = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', psPlayScript(file, 1, 0)], { stdio: 'ignore' })
-      child.on('error', () => { /* 静默 */ })
+      child.on('error', done)
+      child.once('exit', done)
       armKillTimer(child, maxMs)
       return
     }
     // linux：优先 PulseAudio → PipeWire → ALSA。
     const names = ['paplay', 'pw-play', 'aplay']
     const tryPlayer = (index: number): void => {
-      if (index >= names.length) return
+      if (index >= names.length) {
+        done()
+        return
+      }
       const child = spawn(names[index], [file], { stdio: 'ignore' })
       child.on('error', () => tryPlayer(index + 1))
+      child.once('exit', done)
       armKillTimer(child, maxMs)
     }
     tryPlayer(0)
   } catch {
     /* 任何播放异常都不向外抛 */
+    done()
   }
+}
+
+/**
+ * 播放一个音频文件：fire-and-forget、绝不抛错。
+ * @param sound 已校验的音效。
+ * @param maxMs 播放超过该时长强制停止；0 = 不截断。
+ */
+function playFile(sound: Sound, maxMs = 0): void {
+  spawnOnce(sound, maxMs, () => { /* fire-and-forget */ })
+}
+
+/**
+ * 顺序播放一组音效：前一段结束（或被跳过）后隔 gapMs 播下一段；全程后台进行、
+ * fire-and-forget、绝不抛错。用于「读工作区外」这类需要两声叠加语义的事件
+ * （先回答确认音、再提问音，两声之间有可感知的间隔）。
+ * @param sounds 依次播放的音效（ok=false 的自动跳过）。
+ * @param gapMs 两声之间间隔 ms。
+ * @param maxMs 单个音效的最长播放时长；0 = 不截断。
+ */
+function playSequence(sounds: Sound[], gapMs = 150, maxMs = 0): void {
+  const playIndex = (index: number): void => {
+    if (index >= sounds.length) return
+    const sound = sounds[index]
+    if (!sound.ok) {
+      playIndex(index + 1)
+      return
+    }
+    spawnOnce(sound, maxMs, () => {
+      if (index < sounds.length - 1) {
+        const timer = setTimeout(() => playIndex(index + 1), gapMs)
+        timer.unref?.() // 待触发的间隔不该拖住 host 退出
+      }
+    })
+  }
+  playIndex(0)
 }
 
 /**
@@ -290,10 +402,11 @@ function createBarkChain() {
 export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
   const config: Config = { ...DEFAULTS, ...(rawConfig ?? {}) }
 
-  // 四个音效各解析 + stat 一次；此后热路径上再无任何文件系统调用。
+  // 五个音效各解析 + stat 一次；此后热路径上再无任何文件系统调用。
   const commandSound = prepareSound(config.soundCommand, '命令')
   const questionSound = prepareSound(config.soundQuestion, '提问')
   const answerSound = prepareSound(config.soundAnswer, '回答确认')
+  const readOutsideSound = prepareSound(config.soundReadOutside, '读工作区外')
   const barkSound = prepareSound(config.soundBark, '叫声')
 
   /**
@@ -324,16 +437,36 @@ export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
    * 观察每次工具执行的最终结果（observe-only，故障被包容）：
    * - bash 工具 → 该 agent 命令计数 +1（成功或失败都算“执行过命令”），并播「大狗」；
    * - ask_user_question 工具 → 播「诶」：`ask_user_question` 的工具体阻塞到用户
-   *   作答才返回，所以 `tools/result` 在此刻触发 ==「用户刚回答完」，作为确认音。
+   *   作答才返回，所以 `tools/result` 在此刻触发 ==「用户刚回答完」，作为确认音；
+   * - read 工具 → 若【读取成功】且目标文件在会话工作区之外，先播「叮咚鸡」（提问
+   *   同款音效，即 `soundQuestion`）、再播「诶」（与回答确认音同款默认音效）：
+   *   读到工作区外 = 一声像提问那样的提醒 + 一声确认。任一沙箱 mode 下读取都不
+   *   受限，读到的内容可能来自工作区之外；判定口径与 read 工具自身一致（相对
+   *   路径以会话 cwd 为基），仅在确实读到文件时触发（读失败、读到目录不算）。
    * 计数不受 enabled 影响（enabled=false 只静音仍计数），播放才被它门控。
    * 提问瞬间的音效不在这里播（那样它就晚到用户耳中），改由 `tools/execute` 播。
    */
-  ctx.effect(() => ctx.on('tools/result', (exec) => {
+  ctx.effect(() => ctx.on('tools/result', (exec, result) => {
     if (exec.name === BASH_TOOL) {
       bump(agentKey(exec.agent))
       if (config.enabled) playFile(commandSound)
-    } else if (exec.name === ASK_USER_TOOL) {
+      return
+    }
+    if (exec.name === ASK_USER_TOOL) {
       if (config.enabled) playFile(answerSound)
+      return
+    }
+    if (exec.name === READ_TOOL && !result.isError) {
+      // result.isError === false：read 已成功，目标路径是真实存在的常规文件。
+      // exec.agent.session.header.cwd 是会话工作区（read 工具自己的解析根基），
+      // 拿不到时跳过——宁可少响一次也不误报。
+      const filePath = readRequestedFilePath(exec.arguments)
+      const cwd = exec.agent?.session?.header?.cwd
+      if (config.enabled && filePath !== null && cwd !== undefined && !isPathContained(cwd, filePath)) {
+        // 「叮咚鸡」（提问音效）→「诶」（回答确认音），顺序播放避免两声混在一起；
+        // 中间隔 150ms 让两声可分辨（连播在后台进行，不阻塞观察器）。
+        playSequence([questionSound, readOutsideSound], 150)
+      }
     }
   }), 'dsh-audio-dagou: observe tool results')
 
@@ -393,6 +526,7 @@ export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
           bigDog: live(commandSound),
           eh: live(questionSound),
           answer: live(answerSound),
+          readOutside: live(readOutsideSound),
           bark: live(barkSound),
         },
         config: {
@@ -404,6 +538,7 @@ export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
           soundCommand: config.soundCommand,
           soundQuestion: config.soundQuestion,
           soundAnswer: config.soundAnswer,
+          soundReadOutside: config.soundReadOutside,
           soundBark: config.soundBark,
         },
         player,

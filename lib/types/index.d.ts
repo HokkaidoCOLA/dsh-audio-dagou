@@ -11,7 +11,12 @@
  *      此刻 == 工具刚返回、用户刚提交答案）；
  *   4. 每一轮用户请求（一个 agent turn）结束时 → 按本轮命令计数成正比地播放
  *      「叫.wav」，播放次数 = min(round(计数 × barkScale), maxBarks)（默认最多 10 声），
- *      随后把该 agent 的计数清零。
+ *      随后把该 agent 的计数清零；
+ *   5. 模型用 `read` 工具读取【会话工作区之外】的文件（读取成功时）→ 先播
+ *      「叮咚鸡.wav」（与提问同款）、再播「诶.wav」（与回答确认音同款默认音效）：
+ *      任一沙箱 mode 下读取都不受限，读出的内容可能来自工作区之外，读取成功
+ *      的瞬间补一声提问式提醒 + 一声确认。默认音效即上两项；`soundReadOutside`
+ *      可单独换掉「诶」，提问音跟随 `soundQuestion`。
  *
  * 实现要点（符合官方插件规范）：
  *   - Cordis 插件形态：导出 name / inject / Config / apply；
@@ -37,6 +42,8 @@ export interface Config {
     soundQuestion: string;
     /** 用户回答完问题后播放的音效。内置：`诶.wav`；或填任意绝对路径。 */
     soundAnswer: string;
+    /** 读工作区外文件时后播的音效（先播一声提问音 `soundQuestion`，再播它）。内置：`诶.wav`（回答确认音同款）；或填任意绝对路径。 */
+    soundReadOutside: string;
     /** 任务结束时连播的叫声音效。内置：`叫.wav`；或填任意绝对路径。 */
     soundBark: string;
     /** 播放次数 = min(round(命令计数 × 该倍数), maxBarks)；默认 1（严格正比）。 */
@@ -50,4 +57,12 @@ export interface Config {
 }
 /** 配置声明：loader 在挂载前校验入口 config 并填入默认值。 */
 export declare const Config: Schema<Config>;
+/**
+ * 判定 targetPath（相对或绝对路径）是否位于 workspaceRoot 之内（含根自身）。
+ *
+ * 与 dsh-tool-fs 的 `read` 工具同口径：相对路径以工作区为基解析；两侧都经
+ * `realpathDeepest` 归一化后再比较（win32 大小写不敏感，其余平台敏感）。
+ * 导出它是为了冒烟测试能直接覆盖判定逻辑（前缀误判 / 越级、symlink 别名、大小写）。
+ */
+export declare function isPathContained(workspaceRoot: string, targetPath: string): boolean;
 export declare function apply(ctx: Context, rawConfig?: Partial<Config> | null): void;
