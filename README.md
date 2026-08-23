@@ -26,7 +26,8 @@
 | 事件 | 音效 | 说明 |
 |------|------|------|
 | 模型执行一条 `bash` 命令后 | `大狗.wav` | 命令计数 +1（该 agent 名下） |
-| 模型调用 `ask_user_question` 提问时 | `诶.wav` | — |
+| 模型调用 `ask_user_question` 提问时（提问界面弹出瞬间） | `叮咚鸡.wav` | 挂在 `tools/execute`，不等用户作答 |
+| 用户回答完问题后（答案提交瞬间） | `诶.wav` | 挂在 `tools/result`——工具此时刚返回，作确认音 |
 | 每轮用户请求结束（agent turn 收尾） | `叫.wav` × N | N = min(round(本轮命令计数 × barkScale), maxBarks)，随后清零 |
 
 > - 「成正比例」默认 `barkScale = 1`（几次命令就几声），封顶 `maxBarks`（默认 10）。
@@ -58,19 +59,21 @@ dsh plugin --profile web add "$(pwd)"
 ### 配置覆写
 
 后续层（profile 的 `cordis.patch.yml`、`--patch`）可按 id 覆写 config，例如在
-`$DSH_HOME/profiles/web/cordis.patch.yml` 追加：
+`$DSH_HOME/profiles/web/cordis.patch.yml` 追加（注意保留 `- insert:` 包裹）：
 
 ```yaml
-- id: dsh-audio-dagou
-  config:
-    enabled: true
-    maxBarks: 10
-    barkScale: 1
-    barkGapMs: 420
-    # 换自己的音频：填绝对路径即可
-    # soundCommand: /path/to/汪.wav
-    # soundQuestion: /path/to/诶.wav
-    # soundBark:    /path/to/叫.wav
+- insert:
+    - id: dsh-audio-dagou
+      config:
+        enabled: true
+        maxBarks: 10
+        barkScale: 1
+        barkGapMs: 420
+        # 换自己的音频：填绝对路径即可
+        # soundCommand: /path/to/汪.wav
+        # soundQuestion: /path/to/叮咚鸡.wav
+        # soundAnswer:  /path/to/确认音.wav
+        # soundBark:    /path/to/叫.wav
 ```
 
 ## 配置项
@@ -79,7 +82,8 @@ dsh plugin --profile web add "$(pwd)"
 |----|------|------|
 | `enabled` | `true` | 总开关；false 时静音（仍计数） |
 | `soundCommand` | `大狗.wav` | 命令音效（内置名或绝对路径） |
-| `soundQuestion` | `诶.wav` | 提问音效 |
+| `soundQuestion` | `叮咚鸡.wav` | 提问音效（提问界面弹出瞬间） |
+| `soundAnswer` | `诶.wav` | 回答确认音（用户提交答案瞬间） |
 | `soundBark` | `叫.wav` | 收尾连播音效 |
 | `barkScale` | `1` | 播放数 = 命令数 × 此倍数 |
 | `maxBarks` | `10` | 每轮最多几声（需求 ≤10） |

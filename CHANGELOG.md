@@ -2,6 +2,34 @@
 
 版本号为 `0.0.x` 递增，每个版本对应一个 `v0.0.x` git tag。
 
+## v0.0.3
+
+主题：**提问音效改为「提问瞬间」触发，不再等用户答完才响**。
+
+- **修复：提问音效时机错误。** 原来 `诶.wav` 挂在 `tools/result`（工具执行结束的
+  观测事件），而 `ask_user_question` 的工具体会阻塞直到用户作答——声音实际是在
+  用户回答完之后才播放。现在改为挂在 `tools/execute`（环绕分发层）：审批门禁放行
+  后、提问工具体运行（弹出提问界面）之前立即播放，即「模型提问的那一刻」。
+  `tools/result` 不再承担提问音效；其「工具执行结束」语义保留给回答确认音（见下）。
+- **健壮性：`tools/execute` 环绕层严格旁观。** 只播放音效并无条件转发 `next()`，
+  不改 `exec.signal`、不替换结果，保持 around 分发语义安全。
+- **默认提问音效换成「叮咚鸡」**（`assets/叮咚鸡.wav`，取自本地素材库，转入插件
+  包内自包含）：Float32 源转码为 PCM 16-bit 48kHz，保证三平台播放器
+  （afplay / Windows SoundPlayer / paplay）都能出声。
+- **新增回答确认音 `soundAnswer`**（默认 `诶.wav`）：`ask_user_question` 的工具体
+  阻塞到用户作答才返回，因此挂回 `tools/result` 播放「诶」的时机恰为「用户提交
+  答案瞬间」——提问时叮咚鸡、回答后诶，两条链路互不干扰。`audio_dagou_status`
+  同步上报 `soundAnswer` 与就位情况。
+- **修复：`enabled=false` 与「仍计数」文档不符。** 原来监听器在 `enabled` 检查后
+  直接返回，禁用期间命令不再计数、回合结束也不再清零（计数只进不清）。现在计数
+  与清零不受 `enabled` 影响，只有播放被门控——与 Config 注释 / README 承诺一致。
+- **修复：热重载可能留下悬挂的连播循环与 Windows 野声。** `dispose()` 清掉间隔
+  定时器后，正挂在 `await sleep(gapMs)` 上的异步循环因 Promise 永不 settle 而
+  无限悬挂；现改为定时器与「dispose 信号」竞速，卸载即唤醒退出；并记录 Windows
+  分支的 PowerShell 子进程，dispose 时一并终止。
+- **文档：配置覆写示例补上 `- insert:` 包裹。** 原示例只有条目行，照抄会生成
+  无法解析的 patch 文件；已修正为 profile `cordis.patch.yml` 的正确写法。
+
 ## v0.0.2
 
 主题：**热路径不再碰文件系统，待播的叫声不再拖住 host 退出**。

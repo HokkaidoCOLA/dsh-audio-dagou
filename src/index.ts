@@ -3,8 +3,13 @@
  *
  * 行为（用户需求）：
  *   1. 模型每执行一条命令（`bash` 工具调用）后 → 播放「大狗.wav」，并把命令计数 +1；
- *   2. 模型向用户提问（`ask_user_question` 工具调用）时 → 播放「诶.wav」；
- *   3. 每一轮用户请求（一个 agent turn）结束时 → 按本轮命令计数成正比地播放
+ *   2. 模型向用户提问（`ask_user_question` 工具调用）时 → 播放「叮咚鸡.wav」；
+ *      注意时机在「提问瞬间」：挂在 `tools/execute`（批准后、工具体运行前）。
+ *      `ask_user_question` 的 execute 会阻塞直到用户答完，若挂在 `tools/result`
+ *      （执行结束的观测事件）声音会拖到回答完成之后才响；
+ *   3. 用户回答完问题后 → 播放「诶.wav」（回答确认音，挂在 `tools/result`——
+ *      此刻 == 工具刚返回、用户刚提交答案）；
+ *   4. 每一轮用户请求（一个 agent turn）结束时 → 按本轮命令计数成正比地播放
  *      「叫.wav」，播放次数 = min(round(计数 × barkScale), maxBarks)（默认最多 10 声），
  *      随后把该 agent 的计数清零。
  *
@@ -39,8 +44,8 @@ const ASK_USER_TOOL = 'ask_user_question'
 /** 插件自带音频资产目录（lib/../assets）。 */
 const ASSETS_DIR = fileURLToPath(new URL('../assets/', import.meta.url))
 
-/** 内置音效文件名：填这三个名字即用插件自带资产，其余按路径处理。 */
-const BUILTIN_SOUNDS = new Set(['大狗.wav', '诶.wav', '叫.wav'])
+/** 内置音效文件名：填这些名字即用插件自带资产，其余按路径处理。 */
+const BUILTIN_SOUNDS = new Set(['大狗.wav', '叮咚鸡.wav', '诶.wav', '叫.wav'])
 
 /**
  * 每 agent 命令计数的保留上限。
@@ -56,8 +61,10 @@ export interface Config {
   enabled: boolean
   /** 每执行一条命令后播放的音效。内置：`大狗.wav`；或填任意绝对路径。 */
   soundCommand: string
-  /** 模型提问时播放的音效。内置：`诶.wav`；或填任意绝对路径。 */
+  /** 模型提问时播放的音效。内置：`叮咚鸡.wav`；或填任意绝对路径。 */
   soundQuestion: string
+  /** 用户回答完问题后播放的音效。内置：`诶.wav`；或填任意绝对路径。 */
+  soundAnswer: string
   /** 任务结束时连播的叫声音效。内置：`叫.wav`；或填任意绝对路径。 */
   soundBark: string
   /** 播放次数 = min(round(命令计数 × 该倍数), maxBarks)；默认 1（严格正比）。 */
@@ -74,7 +81,8 @@ export interface Config {
 export const Config: Schema<Config> = Schema.object({
   enabled: Schema.boolean().default(true),
   soundCommand: Schema.string().default('大狗.wav'),
-  soundQuestion: Schema.string().default('诶.wav'),
+  soundQuestion: Schema.string().default('叮咚鸡.wav'),
+  soundAnswer: Schema.string().default('诶.wav'),
   soundBark: Schema.string().default('叫.wav'),
   barkScale: Schema.number().min(0).step(0.1).default(1),
   maxBarks: Schema.number().min(1).max(100).step(1).default(10),
@@ -86,7 +94,8 @@ export const Config: Schema<Config> = Schema.object({
 const DEFAULTS: Config = {
   enabled: true,
   soundCommand: '大狗.wav',
-  soundQuestion: '诶.wav',
+  soundQuestion: '叮咚鸡.wav',
+  soundAnswer: '诶.wav',
   soundBark: '叫.wav',
   barkScale: 1,
   maxBarks: 10,
@@ -209,12 +218,19 @@ function createBarkChain() {
   let running = false
   let disposed = false
   let timer: ReturnType<typeof setTimeout> | null = null
+  let currentChild: ChildProcess | null = null
+  let resolveDispose: (() => void) | null = null
+  // 一旦 dispose 即 resolve：让「挂在 sleep 上的循环」立即醒过来退出，
+  // 否则被清除的定时器会让该 Promise 永不 settle，异步循环永久悬挂。
+  const disposedPromise = new Promise<void>((resolve) => { resolveDispose = resolve })
 
   /** 可被 dispose 打断的等待。 */
   const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => {
     timer = setTimeout(resolve, ms)
     timer.unref?.() // 待触发的间隔不该拖住 host 退出
   })
+
+  const wait = (ms: number): Promise<void> => Promise.race([sleep(ms), disposedPromise])
 
   return {
     /**
@@ -232,13 +248,14 @@ function createBarkChain() {
         // Windows 每次 spawn PowerShell 都有约 100 ms 冷启动，连播 10 声等于开
         // 10 个进程；改成在一个进程里循环播完，省掉 N-1 次进程创建。
         try {
-          const child = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', psPlayScript(sound.path, times, gapMs)], { stdio: 'ignore' })
-          const done = (): void => { running = false }
-          child.on('error', done)
-          child.once('exit', done)
-          armKillTimer(child, maxMs > 0 ? times * (maxMs + gapMs) : 0)
+          currentChild = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', psPlayScript(sound.path, times, gapMs)], { stdio: 'ignore' })
+          const done = (): void => { running = false; currentChild = null }
+          currentChild.on('error', done)
+          currentChild.once('exit', done)
+          armKillTimer(currentChild, maxMs > 0 ? times * (maxMs + gapMs) : 0)
         } catch {
           running = false
+          currentChild = null
         }
         return
       }
@@ -249,7 +266,7 @@ function createBarkChain() {
             if (disposed) return
             playFile(sound, maxMs)
             // 最后一声之后不再等待：原实现要多睡一个 gap 才收尾
-            if (i < times - 1) await sleep(gapMs)
+            if (i < times - 1) await wait(gapMs)
           }
         } catch {
           /* 静默 */
@@ -263,6 +280,8 @@ function createBarkChain() {
     dispose(): void {
       disposed = true
       if (timer) { clearTimeout(timer); timer = null }
+      if (resolveDispose) { resolveDispose(); resolveDispose = null }
+      if (currentChild) { currentChild.kill(); currentChild = null }
       running = false
     },
   }
@@ -271,9 +290,10 @@ function createBarkChain() {
 export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
   const config: Config = { ...DEFAULTS, ...(rawConfig ?? {}) }
 
-  // 三个音效各解析 + stat 一次；此后热路径上再无任何文件系统调用。
+  // 四个音效各解析 + stat 一次；此后热路径上再无任何文件系统调用。
   const commandSound = prepareSound(config.soundCommand, '命令')
   const questionSound = prepareSound(config.soundQuestion, '提问')
+  const answerSound = prepareSound(config.soundAnswer, '回答确认')
   const barkSound = prepareSound(config.soundBark, '叫声')
 
   /**
@@ -303,28 +323,45 @@ export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
   /**
    * 观察每次工具执行的最终结果（observe-only，故障被包容）：
    * - bash 工具 → 该 agent 命令计数 +1（成功或失败都算“执行过命令”），并播「大狗」；
-   * - ask_user_question 工具 → 播「诶」。
+   * - ask_user_question 工具 → 播「诶」：`ask_user_question` 的工具体阻塞到用户
+   *   作答才返回，所以 `tools/result` 在此刻触发 ==「用户刚回答完」，作为确认音。
+   * 计数不受 enabled 影响（enabled=false 只静音仍计数），播放才被它门控。
+   * 提问瞬间的音效不在这里播（那样它就晚到用户耳中），改由 `tools/execute` 播。
    */
   ctx.effect(() => ctx.on('tools/result', (exec) => {
-    if (!config.enabled) return
     if (exec.name === BASH_TOOL) {
       bump(agentKey(exec.agent))
-      playFile(commandSound)
+      if (config.enabled) playFile(commandSound)
     } else if (exec.name === ASK_USER_TOOL) {
-      playFile(questionSound)
+      if (config.enabled) playFile(answerSound)
     }
   }), 'dsh-audio-dagou: observe tool results')
 
   /**
+   * 提问瞬间播放提问音效（默认「叮咚鸡」）：`tools/execute` 是环绕分发层
+   * （waterfall），触发时机为审批门禁放行之后、工具体即将运行之前——
+   * `ask_user_question` 的工具体正是「弹出提问界面并阻塞等待用户回答」那一步，
+   * 在此刻出声就是「提问时」。监听器只旁观 + 无条件转发 `next()`，不改变信号、
+   * 不替换结果（around 语义安全）。
+   */
+  ctx.effect(() => ctx.on('tools/execute', (exec, next) => {
+    if (config.enabled && exec.name === ASK_USER_TOOL) {
+      playFile(questionSound)
+    }
+    return next()
+  }), 'dsh-audio-dagou: sound on question asked')
+
+  /**
    * 每轮任务结束边界（模型已给出最终回答、无未决工具调用）：
    * 只结算【该 agent 自己】的本轮命令计数，按比例连播「叫」（封顶 maxBarks），
-   * 结算后删除该 agent 的计数（清零）。监听器内不阻塞（连播在后台异步进行）。
+   * 结算后删除该 agent 的计数（清零）——即使 enabled=false 也照常清零，
+   * 避免禁用期间计数只进不清（「仍计数」语义）。监听器内不阻塞（连播在后台异步进行）。
    */
   ctx.effect(() => ctx.on('agent/turn-stopping', (payload: { agent: Agent }) => {
-    if (!config.enabled) return
     const key = agentKey(payload.agent)
     const n = counts.get(key) ?? 0
     counts.delete(key)
+    if (!config.enabled) return
     const times = Math.min(config.maxBarks, Math.round(n * config.barkScale))
     if (times <= 0) return
     barks.play(barkSound, times, config.barkGapMs, config.barkMaxMs)
@@ -355,6 +392,7 @@ export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
         installed: {
           bigDog: live(commandSound),
           eh: live(questionSound),
+          answer: live(answerSound),
           bark: live(barkSound),
         },
         config: {
@@ -365,6 +403,7 @@ export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
           barkMaxMs: config.barkMaxMs,
           soundCommand: config.soundCommand,
           soundQuestion: config.soundQuestion,
+          soundAnswer: config.soundAnswer,
           soundBark: config.soundBark,
         },
         player,

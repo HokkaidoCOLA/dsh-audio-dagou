@@ -3,8 +3,13 @@
  *
  * 行为（用户需求）：
  *   1. 模型每执行一条命令（`bash` 工具调用）后 → 播放「大狗.wav」，并把命令计数 +1；
- *   2. 模型向用户提问（`ask_user_question` 工具调用）时 → 播放「诶.wav」；
- *   3. 每一轮用户请求（一个 agent turn）结束时 → 按本轮命令计数成正比地播放
+ *   2. 模型向用户提问（`ask_user_question` 工具调用）时 → 播放「叮咚鸡.wav」；
+ *      注意时机在「提问瞬间」：挂在 `tools/execute`（批准后、工具体运行前）。
+ *      `ask_user_question` 的 execute 会阻塞直到用户答完，若挂在 `tools/result`
+ *      （执行结束的观测事件）声音会拖到回答完成之后才响；
+ *   3. 用户回答完问题后 → 播放「诶.wav」（回答确认音，挂在 `tools/result`——
+ *      此刻 == 工具刚返回、用户刚提交答案）；
+ *   4. 每一轮用户请求（一个 agent turn）结束时 → 按本轮命令计数成正比地播放
  *      「叫.wav」，播放次数 = min(round(计数 × barkScale), maxBarks)（默认最多 10 声），
  *      随后把该 agent 的计数清零。
  *
@@ -28,8 +33,10 @@ export interface Config {
     enabled: boolean;
     /** 每执行一条命令后播放的音效。内置：`大狗.wav`；或填任意绝对路径。 */
     soundCommand: string;
-    /** 模型提问时播放的音效。内置：`诶.wav`；或填任意绝对路径。 */
+    /** 模型提问时播放的音效。内置：`叮咚鸡.wav`；或填任意绝对路径。 */
     soundQuestion: string;
+    /** 用户回答完问题后播放的音效。内置：`诶.wav`；或填任意绝对路径。 */
+    soundAnswer: string;
     /** 任务结束时连播的叫声音效。内置：`叫.wav`；或填任意绝对路径。 */
     soundBark: string;
     /** 播放次数 = min(round(命令计数 × 该倍数), maxBarks)；默认 1（严格正比）。 */
