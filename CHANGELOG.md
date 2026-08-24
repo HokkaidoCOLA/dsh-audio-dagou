@@ -2,6 +2,43 @@
 
 版本号为 `0.0.x` 递增，每个版本对应一个 `v0.0.x` git tag。
 
+## v0.0.6
+
+主题：**请求放权也有动静了——审批弹窗「叮咚鸡」，批准后「诶」**。
+
+- **新增：放权审批链路配音效。** 模型发起 `sandbox_permissions` 升级（写/改工作区
+  外文件、bash 升级等，需要用户放权）时：请求投递到答题链（审批弹窗出现）瞬间
+  播「叮咚鸡」（与提问同款）；`next()` 决议为 `allowed-once`（用户批准）瞬间播
+  「诶」（回答确认音）。挂在 `approval/request`（`dsh-user-approval` 的分发
+  waterfall，与 `tools/execute` 提问音效同构）：监听器只旁观 + 无条件转发决议，
+  不拦截、不替换；**拒绝 / 取消 / 无人应答（fail-closed）静默**。
+  `write` / `edit` / `bash` 的升级请求共用同一条审批链，全部覆盖。
+- **类型：`import type { ApprovalOutcome }` 来自 `dsh-user-approval`**（宿主
+  profile 必装；本包未新增运行时依赖）。
+- **冒烟测试：** 新增 `approval/request` 接线检查与「决议原样放行」用例。
+- 说明：审批策略为 `never`（自动拒绝、无弹窗，CI 场景）时请求仍会过链——只会
+  响一声「叮咚鸡」、不响「诶」，可接受。
+
+## v0.0.5
+
+主题：**读工作区外的判定可配置——会话目录与项目目录不一致时不再误报**。
+
+- **修复（实锤根因）：Web GUI 会话的 DSH 工作目录 ≠ 实际项目目录，导致读项目内
+  文档/代码也被判「工作区外」而频繁提醒。** 取证：`session_projcache.json` 显示
+  当前 GUI 会话 `identity.cwd = /Users/Apple/Documents/dsh/dsh-dagou-rewind`，
+  而插件项目在 `dsh-audio-dagou`——插件与 `read` 工具口径一致地以会话 cwd 为
+  边界，于是项目内文件的每次读取都触发了「叮咚鸡→诶」。
+- **新增配置 `workspaceRoots`**（绝对路径数组，默认 `[]`）：判定从「仅会话 cwd」
+  扩展为「会话 cwd ∪ workspaceRoots」，把项目根配上即恢复「只对真正的工作区外
+  访问（如 `.nvm`、`/etc`）提醒」。已连同 `dsh-audio-dagou` 项目根写入
+  profile 的 `cordis.patch.yml`。
+- **新增导出纯函数 `isWorkspacePath(cwd, target, roots)`**，冒烟测试覆盖合并判定
+  （cwd 内 / 额外根内 / 都不在 / 缺 cwd 时按根判定）。
+- **边界不可知时不播：不回归 v0.0.4 的「宁可少响不误报」。** cwd 与 workspaceRoots
+  都拿不到时（无 agent 归属的 SDK / run_code 子调用）不触发「叮咚鸡→诶」，
+  `tools/result` 监听器以 `workspaceKnown` 门控兜底，冒烟测试补充该场景。
+- **`audio_dagou_status` 上报 `config.workspaceRoots`**。
+
 ## v0.0.4
 
 主题：**读工作区外文件也有动静了——和回答问题同款「诶」**。

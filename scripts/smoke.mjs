@@ -3,12 +3,14 @@
  *
  * 覆盖：
  *   1. lib 模块加载与 Cordis 插件形态（name/inject/apply/Config）
- *   2. apply 事件接线（tools/execute、tools/result、agent/turn-stopping）与工具注册
+ *   2. apply 事件接线（tools/execute、tools/result、approval/request、
+ *      agent/turn-stopping）与工具注册
  *   3. bash 计数、ask_user_question 提问瞬间转发、按 agent 隔离、turn 结束清零
  *   4. 三平台播放器映射（darwin→afplay / win32→powershell / linux→paplay|pw-play|aplay）
  *   5. 内置音频资产（中文文件名）真实存在
- *   6. 读工作区外判定（isPathContained：越界 / 前缀误判 / symlink 别名 / 大小写）
- *      与 read 结果分支的健壮性（缺字段不崩、不计入 bash 计数）
+ *   6. 读工作区外判定（isPathContained：越界 / 前缀误判 / symlink 别名 / 大小写；
+ *      isWorkspacePath：cwd ∪ workspaceRoots 合并判定）与 read 结果分支的
+ *      健壮性（缺字段不崩、不计入 bash 计数）
  *
  * 声音路径故意指向不存在的文件，避免 CI 里真的出声；计数逻辑照常全量执行。
  * 断言失败时以非零码退出。
@@ -57,6 +59,7 @@ P.apply(ctx, {
 console.log('[2] 事件接线 / 工具注册')
 check('tools/execute 监听已挂（提问瞬间）', typeof handlers['tools/execute'] === 'function')
 check('tools/result 监听已挂', typeof handlers['tools/result'] === 'function')
+check('approval/request 监听已挂（放权请求）', typeof handlers['approval/request'] === 'function')
 check('agent/turn-stopping 监听已挂', typeof handlers['agent/turn-stopping'] === 'function')
 check('audio_dagou_status 工具已注册', !!registeredTool && registeredTool.name === 'audio_dagou_status')
 
@@ -73,6 +76,13 @@ const execRes = await handlers['tools/execute'](
   async () => ({ isError: false, content: [] }),
 )
 check('tools/execute 转发 next() 结果', execRes && execRes.isError === false)
+
+// 放权请求：approval/request 环绕层必须无条件转发决议（allowed-once 原样放行）
+const approvalRes = await handlers['approval/request'](
+  { agent: main, toolName: 'write', signal: new AbortController().signal },
+  async () => 'allowed-once',
+)
+check('approval/request 转发允许决议', approvalRes === 'allowed-once')
 
 // ask_user_question 走完流水线后 tools/result 也会触发：不得被计入 bash 计数
 handlers['tools/result']({ name: 'ask_user_question', agent: main, token: Symbol() }, { isError: false })
@@ -132,6 +142,13 @@ check('相对路径在工作区内', P.isPathContained(repo, 'src/index.ts') ===
 check('绝对路径在工作区内', P.isPathContained(repo, fileURLToPath(new URL('lib/index.js', import.meta.url))) === true)
 check('上层目录越界', P.isPathContained(repo, '../dsh-audio-dagou-elsewhere/x.txt') === false)
 check('前缀相似的兄弟目录不算包含', P.isPathContained(repoRoot, repoRoot + '2/x.txt') === false)
+
+// workspaceRoots 合并判定：cwd ∪ 额外根 之内才算工作区
+check('isWorkspacePath：cwd 内算工作区', P.isWorkspacePath(repoRoot, 'src/index.ts', []) === true)
+check('isWorkspacePath：额外根内也算工作区', P.isWorkspacePath('/x/ws', '/x/proj/README.md', ['/x/proj']) === true)
+check('isWorkspacePath：都不在才算非工作区', P.isWorkspacePath('/x/ws', '/x/outside/secret.txt', ['/x/proj']) === false)
+check('isWorkspacePath：无 cwd 时按额外根判定', P.isWorkspacePath(undefined, '/x/proj/a.ts', ['/x/proj']) === true)
+check('isWorkspacePath：无 cwd 且无额外根则不判为工作区', P.isWorkspacePath(undefined, '/x/proj/a.ts', []) === false)
 if (process.platform === 'win32') {
   check('win32 忽略大小写', P.isPathContained('C:\\WS\\Repo', 'c:\\ws\\repo\\src\\a.ts') === true)
 }
@@ -159,19 +176,23 @@ try {
   }
 }
 
-// read 结果分支健壮性：缺字段 / 非字符串 file_path 都不崩，也不计入 bash 计数
+// read 结果分支健壮性：缺字段 / 非字符串 file_path / 无 cwd（且无 workspaceRoots）
+// 都不崩、也不计入 bash 计数；「边界不可知」须由分支的 workspaceKnown 门控兜住。
 let threw = false
 try {
   handlers['tools/result']({ name: 'read', agent: { id: 'r1' }, arguments: { file_path: 42 } }, { isError: false })
   handlers['tools/result']({ name: 'read', agent: { id: 'r2' } }, { isError: false })
   handlers['tools/result']({ name: 'read', agent: { id: 'r3' }, arguments: { file_path: '../outside.txt' } }, { isError: true })
+  // 有效 file_path + 无 session（cwd 缺失）+ 本实例无 workspaceRoots：不崩（且按
+  // 门控不触发播放——边界不可知宁可少响，行为由 isWorkspacePath/workspaceKnown 保证）
+  handlers['tools/result']({ name: 'read', agent: { id: 'r4' }, arguments: { file_path: '/etc/hosts' } }, { isError: false })
 } catch (e) {
   threw = true
   console.error('  read 结果分支抛异常:', e)
 }
 check('read 结果分支不抛异常', threw === false)
 const s6 = await status2()
-check('read 不计入命令计数', s6.counts['r1'] === undefined && s6.counts['r2'] === undefined && s6.counts['r3'] === undefined)
+check('read 不计入命令计数', s6.counts['r1'] === undefined && s6.counts['r2'] === undefined && s6.counts['r3'] === undefined && s6.counts['r4'] === undefined)
 
 if (failed > 0) {
   console.error(`\nSMOKE FAILED: ${failed} 项失败`)

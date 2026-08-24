@@ -12,11 +12,17 @@
  *   4. 每一轮用户请求（一个 agent turn）结束时 → 按本轮命令计数成正比地播放
  *      「叫.wav」，播放次数 = min(round(计数 × barkScale), maxBarks)（默认最多 10 声），
  *      随后把该 agent 的计数清零；
- *   5. 模型用 `read` 工具读取【会话工作区之外】的文件（读取成功时）→ 先播
+ *   5. 模型用 `read` 工具读取【工作区之外】的文件（读取成功时）→ 先播
  *      「叮咚鸡.wav」（与提问同款）、再播「诶.wav」（与回答确认音同款默认音效）：
  *      任一沙箱 mode 下读取都不受限，读出的内容可能来自工作区之外，读取成功
  *      的瞬间补一声提问式提醒 + 一声确认。默认音效即上两项；`soundReadOutside`
- *      可单独换掉「诶」，提问音跟随 `soundQuestion`。
+ *      可单独换掉「诶」，提问音跟随 `soundQuestion`。工作区边界 = 会话 cwd ∪
+ *      `workspaceRoots` 配置根（会话目录与项目目录不一致时把项目目录配上）；
+ *   6. 模型【请求放权】（`sandbox_permissions` 升级触发用户审批弹窗）时 →
+ *      播「叮咚鸡.wav」；用户批准（approval 返回 `allowed-once`）的瞬间 →
+ *      播「诶.wav」。挂在 `approval/request`（waterfall，与提问音效同构）：
+ *      请求投递到答题链（弹窗出现）前出声、`next()` 决议（用户允许/拒绝）后
+ *      确认——批准才播「诶」；拒绝/取消/无人应答则保持安静。
  *
  * 实现要点（符合官方插件规范）：
  *   - Cordis 插件形态：导出 name / inject / Config / apply；
@@ -44,6 +50,14 @@ export interface Config {
     soundAnswer: string;
     /** 读工作区外文件时后播的音效（先播一声提问音 `soundQuestion`，再播它）。内置：`诶.wav`（回答确认音同款）；或填任意绝对路径。 */
     soundReadOutside: string;
+    /**
+     * 额外计入「工作区」的绝对路径根（数组）。
+     *
+     * 「读工作区外」的判定以会话 cwd 为边界；当会话工作目录与【实际在操作的项目】
+     * 不一致时（例如 Web GUI 会话建在别的目录、而插件/项目在另一目录），把项目根
+     * 填到这里，读项目内文件就不会再被当成「工作区外」而提醒。为空 = 只用会话 cwd。
+     */
+    workspaceRoots: string[];
     /** 任务结束时连播的叫声音效。内置：`叫.wav`；或填任意绝对路径。 */
     soundBark: string;
     /** 播放次数 = min(round(命令计数 × 该倍数), maxBarks)；默认 1（严格正比）。 */
@@ -65,4 +79,15 @@ export declare const Config: Schema<Config>;
  * 导出它是为了冒烟测试能直接覆盖判定逻辑（前缀误判 / 越级、symlink 别名、大小写）。
  */
 export declare function isPathContained(workspaceRoot: string, targetPath: string): boolean;
+/**
+ * 判定目标路径是否属于「工作区」：会话 cwd 之内，或任一 `workspaceRoots`
+ * 配置根之内（缺 cwd 时仅看配置根）。
+ *
+ * `workspaceRoots` 用于「会话工作目录 ≠ 实际项目目录」的场景（Web GUI 的会话
+ * 可能建在别的目录，而插件项目在另一目录）——把项目根配进去后，读项目内文件
+ * 就不再被当成「工作区外」。cwd 与配置根**都缺**时返回 false——调用方必须先
+ * 确认边界「可知」（见 tools/result 监听器里的 workspaceKnown 门控），否则
+ * 所有 read 都会被误判为工作区外。导出它是为了冒烟测试能直接覆盖合并判定逻辑。
+ */
+export declare function isWorkspacePath(cwd: string | undefined, targetPath: string, workspaceRoots: readonly string[]): boolean;
 export declare function apply(ctx: Context, rawConfig?: Partial<Config> | null): void;

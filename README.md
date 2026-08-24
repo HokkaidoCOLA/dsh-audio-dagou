@@ -1,6 +1,6 @@
 # dsh-audio-dagou
 
-给 DeepSeek Harness（DSH）会话配点动物系音效的宿主插件：模型干活时「大狗」，提问时「诶？」，读到工作区外文件时「诶」（同款回答确认音），一轮任务收尾按命令条数成比例「汪汪汪」地叫（最多 10 声）。
+给 DeepSeek Harness（DSH）会话配点动物系音效的宿主插件：模型干活时「大狗」，提问时「叮咚鸡」，请求放权时「叮咚鸡」（你批准后「诶」），读到工作区外文件时「叮咚鸡→诶」（提醒+确认，工作区 = 会话 cwd ∪ `workspaceRoots` 配置根），一轮任务收尾按命令条数成比例「汪汪汪」地叫（最多 10 声）。
 
 
 ## 环境要求
@@ -28,17 +28,22 @@
 | 模型执行一条 `bash` 命令后 | `大狗.wav` | 命令计数 +1（该 agent 名下） |
 | 模型调用 `ask_user_question` 提问时（提问界面弹出瞬间） | `叮咚鸡.wav` | 挂在 `tools/execute`，不等用户作答 |
 | 用户回答完问题后（答案提交瞬间） | `诶.wav` | 挂在 `tools/result`——工具此时刚返回，作确认音 |
+| 模型**请求放权**时（审批弹窗出现瞬间，如 `sandbox_permissions` 升级） | `叮咚鸡.wav` | 挂在 `approval/request`（waterfall），不等用户决定 |
+| 用户**批准放权**后 | `诶.wav` | `approval/request` 的 `next()` 返回 `allowed-once` 时；拒绝/取消/无人应答则静默 |
 | 模型用 `read` 读取到**工作区之外**的文件时 | `叮咚鸡.wav` → `诶.wav` | 先提问音、再回答确认音（顺序播，间隔 150ms）；见下方判定口径 |
 | 每轮用户请求结束（agent turn 收尾） | `叫.wav` × N | N = min(round(本轮命令计数 × barkScale), maxBarks)，随后清零 |
 
 > - 「成正比例」默认 `barkScale = 1`（几次命令就几声），封顶 `maxBarks`（默认 10）。
 > - 命令计数**按 agent 隔离**：subagent 的回合结束只结算它自己的计数，不会误清零主 agent、也不会白叫。
-> - 「读工作区外」判定口径与 `read` 工具自身一致：相对路径以会话工作区（cwd）为基，
->   两者都经 realpath 归一化（`/tmp` → `/private/tmp`、工作区内 symlink 指向外部的
->   文件都能正确识别，win32 大小写不敏感）；**仅读取成功时触发**（读失败、读到目录
->   不算）。任一沙箱 mode 下读取都不受限，故该音效与 mode 无关。此时先播
->   `soundQuestion`（`叮咚鸡.wav`）再播 `soundReadOutside`（默认 `诶.wav`），
->   两声间隔 150ms。
+> - 「读工作区外」判定口径与 `read` 工具自身一致：工作区 = **会话 cwd ∪ `workspaceRoots`
+>   配置根**；相对路径以工作区为基，两侧都经 realpath 归一化（`/tmp` → `/private/tmp`、
+>   工作区内 symlink 指向外部的文件都能正确识别，win32 大小写不敏感）；**仅读取成功时
+>   触发**（读失败、读到目录不算）。任一沙箱 mode 下读取都不受限，故该音效与 mode
+>   无关。此时先播 `soundQuestion`（`叮咚鸡.wav`）再播 `soundReadOutside`（默认
+>   `诶.wav`），两声间隔 150ms。
+>   > 典型场景：Web GUI 的会话可能建在别的目录（如 `dsh-dagou-rewind`），而插件项目在
+>   > `dsh-audio-dagou`——此时读项目内文档/代码会被判「工作区外」而频繁提醒；把项目
+>   > 根配进 `workspaceRoots` 即恢复「只对真正的工作区外访问（.nvm、/etc 等）提醒」。
 > - 音频播放全部 fire-and-forget、不阻塞任何流程。
 
 ## 安装（装配进 web profile）
@@ -82,6 +87,9 @@ dsh plugin --profile web add "$(pwd)"
         # soundAnswer:  /path/to/确认音.wav
         # soundReadOutside: /path/to/读外面啦.wav
         # soundBark:    /path/to/叫.wav
+        # 会话目录与项目目录不一致时，把项目根计入工作区（数组）
+        # workspaceRoots:
+        #   - /path/to/your/project
 ```
 
 ## 配置项
@@ -93,6 +101,7 @@ dsh plugin --profile web add "$(pwd)"
 | `soundQuestion` | `叮咚鸡.wav` | 提问音效（提问界面弹出瞬间） |
 | `soundAnswer` | `诶.wav` | 回答确认音（用户提交答案瞬间） |
 | `soundReadOutside` | `诶.wav` | 读工作区外音效（先播一声 `soundQuestion` 提问音，再播它） |
+| `workspaceRoots` | `[]` | 额外计入「工作区」的绝对路径根（数组）；会话目录与项目目录不一致时把项目根填上，读项目内文件就不再当工作区外提醒 |
 | `soundBark` | `叫.wav` | 收尾连播音效 |
 | `barkScale` | `1` | 播放数 = 命令数 × 此倍数 |
 | `maxBarks` | `10` | 每轮最多几声（需求 ≤10） |

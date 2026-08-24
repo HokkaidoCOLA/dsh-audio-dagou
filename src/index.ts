@@ -12,11 +12,17 @@
  *   4. 每一轮用户请求（一个 agent turn）结束时 → 按本轮命令计数成正比地播放
  *      「叫.wav」，播放次数 = min(round(计数 × barkScale), maxBarks)（默认最多 10 声），
  *      随后把该 agent 的计数清零；
- *   5. 模型用 `read` 工具读取【会话工作区之外】的文件（读取成功时）→ 先播
+ *   5. 模型用 `read` 工具读取【工作区之外】的文件（读取成功时）→ 先播
  *      「叮咚鸡.wav」（与提问同款）、再播「诶.wav」（与回答确认音同款默认音效）：
  *      任一沙箱 mode 下读取都不受限，读出的内容可能来自工作区之外，读取成功
  *      的瞬间补一声提问式提醒 + 一声确认。默认音效即上两项；`soundReadOutside`
- *      可单独换掉「诶」，提问音跟随 `soundQuestion`。
+ *      可单独换掉「诶」，提问音跟随 `soundQuestion`。工作区边界 = 会话 cwd ∪
+ *      `workspaceRoots` 配置根（会话目录与项目目录不一致时把项目目录配上）；
+ *   6. 模型【请求放权】（`sandbox_permissions` 升级触发用户审批弹窗）时 →
+ *      播「叮咚鸡.wav」；用户批准（approval 返回 `allowed-once`）的瞬间 →
+ *      播「诶.wav」。挂在 `approval/request`（waterfall，与提问音效同构）：
+ *      请求投递到答题链（弹窗出现）前出声、`next()` 决议（用户允许/拒绝）后
+ *      确认——批准才播「诶」；拒绝/取消/无人应答则保持安静。
  *
  * 实现要点（符合官方插件规范）：
  *   - Cordis 插件形态：导出 name / inject / Config / apply；
@@ -31,6 +37,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent' // 引入 dsh-agent 的事件类型增强（agent/turn-stopping）
+import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval' // approval/request 事件类型增强（dsh-user-approval，宿主 profile 必装）
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import Schema from '@deepseek-ai/schemastery'
 import { type ChildProcess, spawn } from 'node:child_process'
@@ -74,6 +81,14 @@ export interface Config {
   soundAnswer: string
   /** 读工作区外文件时后播的音效（先播一声提问音 `soundQuestion`，再播它）。内置：`诶.wav`（回答确认音同款）；或填任意绝对路径。 */
   soundReadOutside: string
+  /**
+   * 额外计入「工作区」的绝对路径根（数组）。
+   *
+   * 「读工作区外」的判定以会话 cwd 为边界；当会话工作目录与【实际在操作的项目】
+   * 不一致时（例如 Web GUI 会话建在别的目录、而插件/项目在另一目录），把项目根
+   * 填到这里，读项目内文件就不会再被当成「工作区外」而提醒。为空 = 只用会话 cwd。
+   */
+  workspaceRoots: string[]
   /** 任务结束时连播的叫声音效。内置：`叫.wav`；或填任意绝对路径。 */
   soundBark: string
   /** 播放次数 = min(round(命令计数 × 该倍数), maxBarks)；默认 1（严格正比）。 */
@@ -93,6 +108,7 @@ export const Config: Schema<Config> = Schema.object({
   soundQuestion: Schema.string().default('叮咚鸡.wav'),
   soundAnswer: Schema.string().default('诶.wav'),
   soundReadOutside: Schema.string().default('诶.wav'),
+  workspaceRoots: Schema.array(Schema.string()).default([]),
   soundBark: Schema.string().default('叫.wav'),
   barkScale: Schema.number().min(0).step(0.1).default(1),
   maxBarks: Schema.number().min(1).max(100).step(1).default(10),
@@ -107,6 +123,7 @@ const DEFAULTS: Config = {
   soundQuestion: '叮咚鸡.wav',
   soundAnswer: '诶.wav',
   soundReadOutside: '诶.wav',
+  workspaceRoots: [],
   soundBark: '叫.wav',
   barkScale: 1,
   maxBarks: 10,
@@ -165,6 +182,25 @@ export function isPathContained(workspaceRoot: string, targetPath: string): bool
   if (b === a) return true
   const prefix = a.endsWith(sep) ? a : a + sep
   return b.startsWith(prefix)
+}
+
+/**
+ * 判定目标路径是否属于「工作区」：会话 cwd 之内，或任一 `workspaceRoots`
+ * 配置根之内（缺 cwd 时仅看配置根）。
+ *
+ * `workspaceRoots` 用于「会话工作目录 ≠ 实际项目目录」的场景（Web GUI 的会话
+ * 可能建在别的目录，而插件项目在另一目录）——把项目根配进去后，读项目内文件
+ * 就不再被当成「工作区外」。cwd 与配置根**都缺**时返回 false——调用方必须先
+ * 确认边界「可知」（见 tools/result 监听器里的 workspaceKnown 门控），否则
+ * 所有 read 都会被误判为工作区外。导出它是为了冒烟测试能直接覆盖合并判定逻辑。
+ */
+export function isWorkspacePath(
+  cwd: string | undefined,
+  targetPath: string,
+  workspaceRoots: readonly string[],
+): boolean {
+  if (cwd !== undefined && isPathContained(cwd, targetPath)) return true
+  return workspaceRoots.some((root) => isPathContained(root, targetPath))
 }
 
 /** 从工具 arguments 里取 `read` 的 file_path；缺失或非字符串时返回 null。 */
@@ -458,11 +494,13 @@ export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
     }
     if (exec.name === READ_TOOL && !result.isError) {
       // result.isError === false：read 已成功，目标路径是真实存在的常规文件。
-      // exec.agent.session.header.cwd 是会话工作区（read 工具自己的解析根基），
-      // 拿不到时跳过——宁可少响一次也不误报。
+      // exec.agent.session.header.cwd 是会话工作区（read 工具自己的解析根基）。
+      // 边界必须「可知」才判定：cwd 与 workspaceRoots 都拿不到时跳过——
+      // 宁可少响一次也不误报（例如无 agent 归属的 SDK / run_code 子调用）。
       const filePath = readRequestedFilePath(exec.arguments)
       const cwd = exec.agent?.session?.header?.cwd
-      if (config.enabled && filePath !== null && cwd !== undefined && !isPathContained(cwd, filePath)) {
+      const workspaceKnown = cwd !== undefined || config.workspaceRoots.length > 0
+      if (config.enabled && workspaceKnown && filePath !== null && !isWorkspacePath(cwd, filePath, config.workspaceRoots)) {
         // 「叮咚鸡」（提问音效）→「诶」（回答确认音），顺序播放避免两声混在一起；
         // 中间隔 150ms 让两声可分辨（连播在后台进行，不阻塞观察器）。
         playSequence([questionSound, readOutsideSound], 150)
@@ -483,6 +521,27 @@ export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
     }
     return next()
   }), 'dsh-audio-dagou: sound on question asked')
+
+  /**
+   * 「请求放权 → 用户批准」的音效链：`approval/request` 是审批服务的分发
+   * waterfall（`ctx.approval`，dsh-user-approval）——模型发起 `sandbox_permissions`
+   * 升级（写/改工作区外文件、bash 升级）时，请求会被投递给答题链（弹窗/审批界面
+   * 呈现）：
+   *   - 投递瞬间（弹窗出现前）→ 播「叮咚鸡」（与提问同款提醒）；
+   *   - `next()` 决议的瞬间且结果为 `allowed-once`（用户批准放权）→ 播「诶」
+   *     （回答确认音）。拒绝 / 取消 / 无人应答（fail-closed）静默——不打扰。
+   * 监听器只旁观 + 无条件转发 `next()`，不拦截、不替换决议（waterfall 语义安全）。
+   * 注：策略为 `never`（自动拒绝、无弹窗）时不会有真正的人类答题，但请求仍会
+   * 过链——此时仅「叮咚鸡」可能响一次（无 UI 的 CI 场景极少见，可接受）。
+   */
+  ctx.effect(() => ctx.on('approval/request', async (req, next: () => Promise<ApprovalOutcome>) => {
+    if (config.enabled) playFile(questionSound)
+    const outcome = await next()
+    if (config.enabled && outcome === 'allowed-once') {
+      playFile(answerSound)
+    }
+    return outcome
+  }), 'dsh-audio-dagou: sound on approval asked/granted')
 
   /**
    * 每轮任务结束边界（模型已给出最终回答、无未决工具调用）：
@@ -539,6 +598,7 @@ export function apply(ctx: Context, rawConfig?: Partial<Config> | null): void {
           soundQuestion: config.soundQuestion,
           soundAnswer: config.soundAnswer,
           soundReadOutside: config.soundReadOutside,
+          workspaceRoots: config.workspaceRoots,
           soundBark: config.soundBark,
         },
         player,

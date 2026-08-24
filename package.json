@@ -1,7 +1,7 @@
 {
   "name": "@dsh-external/dsh-audio-dagou",
-  "version": "0.0.4",
-  "description": "一个给 DeepSeek Harness（DSH）web 会话配音效的插件「大狗」：执行命令后播「大狗」，模型向你提问时播「叮咚鸡」，读到工作区外文件时播「诶」（同回答确认音），每轮任务结束按命令次数成正比地播「叫」（上限 10 声）。",
+  "version": "0.0.6",
+  "description": "一个给 DeepSeek Harness（DSH）web 会话配音效的插件「大狗」：执行命令后播「大狗」，模型提问/请求放权（审批弹窗）时播「叮咚鸡」，你批准或回答后播「诶」，读到工作区外文件时先播「叮咚鸡」再播「诶」（提醒+确认），每轮任务结束按命令次数成正比地播「叫」（上限 10 声）。",
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/types/index.d.ts",
@@ -41,7 +41,8 @@
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.0-rc <5",
     "@deepseek-ai/dsh-agent": "^0.1.0-rc.7",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.7"
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.7",
+    "@deepseek-ai/dsh-user-approval": "^0.1.0-rc.7"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
@@ -49,7 +50,8 @@
     "@deepseek-ai/dsh-tools": "0.1.0-rc.7",
     "@deepseek-ai/schemastery": "^3.18.1",
     "@types/node": "^24.13.3",
-    "typescript": "^5.9.0"
+    "typescript": "^5.9.0",
+    "@deepseek-ai/dsh-user-approval": "0.1.0-rc.7"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
